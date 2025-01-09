@@ -18,7 +18,7 @@ pub struct Cache<E: Environment> {
     env: E,
     expiration_times: Arc<ArcSwap<(Duration, Duration)>>,
     lru_expires_by: Arc<Mutex<OffsetDateTime>>,
-    schemas: Arc<Mutex<LruCache<Url, Arc<Value>>>>,
+    schemas: Arc<Mutex<LruCache<Url, Value>>>,
     cache_path: Arc<ArcSwap<Option<PathBuf>>>,
 }
 
@@ -39,7 +39,7 @@ impl<E: Environment> Cache<E> {
         }
     }
 
-    pub fn get_schema(&self, url: &Url) -> Option<Arc<Value>> {
+    pub fn get_schema(&self, url: &Url) -> Option<Value> {
         self.schemas.lock().get(url).cloned()
     }
 
@@ -55,7 +55,7 @@ impl<E: Environment> Cache<E> {
         &self,
         value_url: &Url,
         include_expired: bool,
-    ) -> Result<Arc<Value>, anyhow::Error> {
+    ) -> Result<Value, anyhow::Error> {
         let now = self.env.now();
 
         // We invalidate the in-memory cache at a regular interval.
@@ -77,20 +77,21 @@ impl<E: Environment> Cache<E> {
                     return Err(anyhow!("document expired"));
                 }
 
-                let s = Arc::new(schema.value);
-                self.schemas.lock().put(value_url.clone(), s.clone());
-                Ok(s)
+                self.schemas
+                    .lock()
+                    .put(value_url.clone(), schema.value.clone());
+                Ok(schema.value)
             }
             None => Err(anyhow!("cache path not set")),
         }
     }
 
-    pub async fn store(&self, url: Url, value: Arc<Value>) -> Result<(), anyhow::Error> {
+    pub async fn store(&self, url: Url, value: Value) -> Result<(), anyhow::Error> {
         self.schemas.lock().put(url.clone(), value.clone());
         self.save(url, value).await
     }
 
-    pub async fn save(&self, url: Url, value: Arc<Value>) -> Result<(), anyhow::Error> {
+    pub async fn save(&self, url: Url, value: Value) -> Result<(), anyhow::Error> {
         let expires_by = self.env.now() + self.expiration_times.load().1;
 
         match &**self.cache_path.load() {
@@ -100,7 +101,7 @@ impl<E: Environment> Cache<E> {
                 let bytes = serde_json::to_vec(&CachedJson {
                     expires_by,
                     url,
-                    value: (*value).clone(),
+                    value: value.clone(),
                 })?;
                 self.env.write_file(&p, &bytes).await?;
                 Ok(())

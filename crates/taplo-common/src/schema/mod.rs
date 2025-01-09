@@ -5,7 +5,9 @@ use async_recursion::async_recursion;
 use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
 use json_value_merge::Merge;
-use jsonschema::{error::ValidationErrorKind, JSONSchema, SchemaResolver, ValidationError};
+use jsonschema::{
+    error::ValidationErrorKind, ReferencingError, Retrieve, ValidationError, Validator,
+};
 use parking_lot::Mutex;
 use regex::Regex;
 use serde_json::Value;
@@ -24,18 +26,17 @@ pub mod ext;
 
 pub mod builtins {
     use serde_json::Value;
-    use std::sync::Arc;
     use url::Url;
 
     pub const TAPLO_CONFIG_URL: &str = "taplo://taplo.toml";
 
     #[must_use]
-    pub fn taplo_config_schema() -> Arc<Value> {
-        Arc::new(serde_json::to_value(schemars::schema_for!(crate::config::Config)).unwrap())
+    pub fn taplo_config_schema() -> Value {
+        serde_json::to_value(schemars::schema_for!(crate::config::Config)).unwrap()
     }
 
     #[must_use]
-    pub fn builtin_schema(url: &Url) -> Option<Arc<Value>> {
+    pub fn builtin_schema(url: &Url) -> Option<Value> {
         if url.as_str() == TAPLO_CONFIG_URL {
             Some(taplo_config_schema())
         } else {
@@ -50,7 +51,7 @@ pub struct Schemas<E: Environment> {
     associations: SchemaAssociations<E>,
     concurrent_requests: Arc<Semaphore>,
     http: reqwest::Client,
-    validators: Arc<Mutex<LruCache<Url, Arc<JSONSchema>>>>,
+    validators: Arc<Mutex<LruCache<Url, Arc<Validator>>>>,
     cache: Cache<E>,
 }
 
@@ -125,7 +126,7 @@ impl<E: Environment> Schemas<E> {
 
     async fn validate_impl(
         &self,
-        validator: &JSONSchema,
+        validator: &Validator,
         value: &Value,
     ) -> Result<Vec<ValidationError<'static>>, anyhow::Error> {
         // The following loop is required for retrieving external schemas.
@@ -134,61 +135,56 @@ impl<E: Environment> Schemas<E> {
         // a validation path that requires it, so we might have to loop many times
         // to fully validate according to a schema that has many nested references.
         loop {
-            match validator.validate(value) {
-                Ok(()) => return Ok(Vec::new()),
-                Err(errors) => {
-                    let errors: Vec<_> = errors
-                        .map(|err| ValidationError {
-                            instance: Cow::Owned(err.instance.into_owned()),
-                            kind: err.kind,
-                            instance_path: err.instance_path,
-                            schema_path: err.schema_path,
-                        })
-                        .collect();
+            let errors = validator
+                .iter_errors(value)
+                .map(|err| ValidationError {
+                    instance: Cow::Owned(err.instance.into_owned()),
+                    kind: err.kind,
+                    instance_path: err.instance_path,
+                    schema_path: err.schema_path,
+                })
+                .collect::<Vec<_>>();
 
-                    // We check whether there were any external schema errors,
-                    // and retrieve the schemas accordingly.
-                    let mut external_schema_requests: FuturesUnordered<_> = errors
-                        .iter()
-                        .filter_map(|err| {
-                            if let ValidationErrorKind::Resolver { url, .. } = &err.kind {
-                                Some(async {
-                                    let value = self.load_schema(url).await?;
-                                    drop(self.cache.store(url.clone(), value));
-                                    Result::<(), anyhow::Error>::Ok(())
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+            let mut external_schema_requests: FuturesUnordered<_> = errors
+                .iter()
+                .filter_map(|err| match &err.kind {
+                    ValidationErrorKind::Referencing(err) => match err {
+                        ReferencingError::Unretrievable { uri, source: _ } => Some(async {
+                            let uri = Url::parse(uri)?;
+                            let value = self.load_schema(&uri).await?;
+                            drop(self.cache.store(uri, value));
+                            Result::<(), anyhow::Error>::Ok(())
+                        }),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
 
-                    // There are no external schemas to retrieve,
-                    // return the errors as-is.
-                    if external_schema_requests.is_empty() {
-                        drop(external_schema_requests);
-                        return Ok(errors);
-                    }
+            // There are no external schemas to retrieve,
+            // return the errors as-is.
+            if external_schema_requests.is_empty() {
+                drop(external_schema_requests);
+                return Ok(errors);
+            }
 
-                    // Retrieve external schemas, and return on the first failure.
-                    while let Some(external_schema_result) = external_schema_requests.next().await {
-                        external_schema_result?;
-                    }
+            // Retrieve external schemas, and return on the first failure.
+            while let Some(external_schema_result) = external_schema_requests.next().await {
+                external_schema_result?;
+            }
 
-                    // Try validation again, now with external schemas
-                    // resolved and cached.
-                    continue;
-                }
-            };
+            // Try validation again, now with external schemas
+            // resolved and cached.
+            continue;
         }
     }
 
-    pub async fn add_schema(&self, schema_url: &Url, schema: Arc<Value>) {
+    pub async fn add_schema(&self, schema_url: &Url, schema: Value) {
         drop(self.cache.store(schema_url.clone(), schema).await);
     }
 
     #[tracing::instrument(skip_all, fields(%schema_url))]
-    pub async fn load_schema(&self, schema_url: &Url) -> Result<Arc<Value>, anyhow::Error> {
+    pub async fn load_schema(&self, schema_url: &Url) -> Result<Value, anyhow::Error> {
         if let Ok(s) = self.cache.load(schema_url, false).await {
             tracing::debug!(%schema_url, "schema was found in cache");
             return Ok(s);
@@ -198,7 +194,7 @@ impl<E: Environment> Schemas<E> {
             builtin
         } else {
             match self.fetch_external(schema_url).await {
-                Ok(s) => Arc::new(s),
+                Ok(s) => s,
                 Err(error) => {
                     tracing::warn!(%error, "failed to fetch schema");
                     if let Ok(s) = self.cache.load(schema_url, true).await {
@@ -217,7 +213,7 @@ impl<E: Environment> Schemas<E> {
         Ok(schema)
     }
 
-    fn get_validator(&self, schema_url: &Url) -> Option<Arc<JSONSchema>> {
+    fn get_validator(&self, schema_url: &Url) -> Option<Arc<Validator>> {
         if self.cache().lru_expired() {
             self.validators.lock().clear();
         }
@@ -229,7 +225,7 @@ impl<E: Environment> Schemas<E> {
         &self,
         schema_url: Url,
         schema: &Value,
-    ) -> Result<Arc<JSONSchema>, anyhow::Error> {
+    ) -> Result<Arc<Validator>, anyhow::Error> {
         let v = Arc::new(self.create_validator(schema)?);
         self.validators.lock().put(schema_url, v.clone());
         Ok(v)
@@ -237,7 +233,7 @@ impl<E: Environment> Schemas<E> {
 
     #[async_recursion(?Send)]
     #[must_use]
-    pub(crate) async fn resolve_schema(&self, url: Url) -> Result<Arc<Value>, anyhow::Error> {
+    pub(crate) async fn resolve_schema(&self, url: Url) -> Result<Value, anyhow::Error> {
         match url.fragment() {
             Some(fragment) => {
                 let mut res_url = url.clone();
@@ -246,7 +242,7 @@ impl<E: Environment> Schemas<E> {
                 let ptr = String::from("/") + fragment;
                 schema
                     .pointer(&ptr)
-                    .map(|v| Arc::new(v.clone()))
+                    .cloned()
                     .ok_or_else(|| anyhow!("failed to resolve relative schema"))
             }
             None => {
@@ -257,14 +253,14 @@ impl<E: Environment> Schemas<E> {
         }
     }
 
-    fn create_validator(&self, schema: &Value) -> Result<JSONSchema, anyhow::Error> {
-        JSONSchema::options()
-            .with_resolver(CacheSchemaResolver {
+    fn create_validator(&self, schema: &Value) -> Result<Validator, anyhow::Error> {
+        Validator::options()
+            .with_retriever(CacheSchemaRetriever {
                 cache: self.cache().clone(),
             })
             .with_format("semver", formats::semver)
             .with_format("semver-requirement", formats::semver_req)
-            .compile(schema)
+            .build(schema)
             .map_err(|err| anyhow!("invalid schema: {err}"))
     }
 
@@ -598,7 +594,7 @@ impl<E: Environment> Schemas<E> {
         }
     }
 
-    async fn ref_schema_value(&self, root_url: &Url, schema: &Value) -> Option<Arc<Value>> {
+    async fn ref_schema_value(&self, root_url: &Url, schema: &Value) -> Option<Value> {
         if let Some(r) = schema.schema_ref() {
             let url = match reference_url(root_url, r)
                 .ok_or_else(|| anyhow!("could not determine schema URL"))
@@ -648,19 +644,17 @@ impl ValueExt for Value {
     }
 }
 
-struct CacheSchemaResolver<E: Environment> {
+struct CacheSchemaRetriever<E: Environment> {
     cache: Cache<E>,
 }
 
-impl<E: Environment> SchemaResolver for CacheSchemaResolver<E> {
-    fn resolve(
+impl<E: Environment> Retrieve for CacheSchemaRetriever<E> {
+    fn retrieve(
         &self,
-        _root_schema: &serde_json::Value,
-        url: &Url,
-        _original_ref: &str,
-    ) -> Result<Arc<serde_json::Value>, jsonschema::SchemaResolverError> {
+        uri: &jsonschema::Uri<&str>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         self.cache
-            .get_schema(url)
+            .get_schema(&Url::parse(uri.as_str())?)
             .ok_or_else(|| WouldBlockError.into())
     }
 }
@@ -691,11 +685,11 @@ impl NodeValidationError {
 
         'outer: for path in &error.instance_path {
             match path {
-                jsonschema::paths::PathChunk::Property(p) => match node {
+                jsonschema::paths::LocationSegment::Property(p) => match node {
                     dom::Node::Table(t) => {
                         let entries = t.entries().read();
                         for (k, entry) in entries.iter() {
-                            if k.value() == &**p {
+                            if k.value() == &*p {
                                 keys = keys.join(k.clone());
                                 node = entry.clone();
                                 continue 'outer;
@@ -705,11 +699,10 @@ impl NodeValidationError {
                     }
                     _ => return Err(anyhow!("invalid key")),
                 },
-                jsonschema::paths::PathChunk::Index(idx) => {
-                    node = node.try_get(*idx).map_err(|_| anyhow!("invalid index"))?;
-                    keys = keys.join(*idx);
+                jsonschema::paths::LocationSegment::Index(idx) => {
+                    node = node.try_get(idx).map_err(|_| anyhow!("invalid index"))?;
+                    keys = keys.join(idx);
                 }
-                jsonschema::paths::PathChunk::Keyword(_) => {}
             }
         }
 

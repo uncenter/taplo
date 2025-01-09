@@ -326,7 +326,7 @@ impl<E: Environment> SchemaAssociations<E> {
 
     async fn load_catalog(&self, index_url: &Url) -> Result<SchemaCatalog, anyhow::Error> {
         if let Ok(s) = self.cache.load(index_url, false).await {
-            return Ok(serde_json::from_value((*s).clone())?);
+            return Ok(serde_json::from_value(s.clone())?);
         }
 
         let mut index = match self.fetch_external(index_url).await {
@@ -334,7 +334,7 @@ impl<E: Environment> SchemaAssociations<E> {
             Err(error) => {
                 tracing::warn!(?error, "failed to fetch catalog");
                 if let Ok(s) = self.cache.load(index_url, true).await {
-                    return Ok(serde_json::from_value((*s).clone())?);
+                    return Ok(serde_json::from_value(s.clone())?);
                 }
                 return Err(error);
             }
@@ -345,7 +345,7 @@ impl<E: Environment> SchemaAssociations<E> {
         if self.cache.is_cache_path_set() {
             if let Err(error) = self
                 .cache
-                .save(index_url.clone(), Arc::new(serde_json::to_value(&index)?))
+                .save(index_url.clone(), serde_json::to_value(&index)?)
                 .await
             {
                 tracing::warn!(%error, "failed to cache index");
